@@ -5,14 +5,14 @@ cubo_4_piezas.py
 Bloque 3D 2x2x2 (8 cubos individuales)
 --------------------------------------
 - 8 cubos pequeños forman un único "CUBO GENERAL" 2x2x2.
-- Cada cubo es un objeto independiente, pero por ahora se comportan como
+- Cada cubo es un objeto independiente, pero en inicio se comportan como
   un solo bloque:
-    * mismo zoom
-    * mismo movimiento (offset 2D)
-    * misma rotación global
+    * mismo zoom (CompositeCubes.scale)
+    * mismo movimiento (CompositeCubes.group_offset_2d)
+    * misma rotación global (CompositeCubes.angle_x/angle_y/angle_z)
 
-- No se implementa aún la separación individual de cubos; las funciones
-  toggle_attach y move_piece quedan como "stub" para un paso futuro.
+- Se puede SEPARAR un cubo (attached=False).
+- Los cubos separados se mueven en 2D con move_piece evitando "encimarse".
 """
 
 import cv2
@@ -113,10 +113,10 @@ class SimpleCube3D:
         Dibuja el cubo sobre el frame.
 
         Parámetros:
-        - scale: escala global del bloque.
-        - angle_x, angle_y, angle_z: rotación global.
-        - offset_2d: traslación en la imagen (mover todo el bloque).
-        - center_unit_3d: centro del cubo en coordenadas de bloque (ej. ±0.5).
+        - scale: escala global (o efectiva) de la pieza.
+        - angle_x, angle_y, angle_z: rotación.
+        - offset_2d: traslación en la imagen.
+        - center_unit_3d: centro del cubo en coord. de bloque (ej. ±0.5).
 
         Devuelve:
         - pts_2d: puntos 2D proyectados (8 x 2).
@@ -125,17 +125,17 @@ class SimpleCube3D:
         # 1) Sumamos centro 3D en coordenadas de bloque
         verts = self.base_vertices + np.array(center_unit_3d, dtype=np.float32)
 
-        # 2) Escalamos todo (bloque completo)
+        # 2) Escalamos
         verts *= scale
 
-        # 3) Rotamos todo el bloque
+        # 3) Rotamos
         R = self.rotation_matrix(angle_x, angle_y, angle_z)
         verts_rot = verts @ R.T
 
         # 4) Proyectamos
         pts_2d, depths = self._project_points(verts_rot, frame.shape, f=800.0)
 
-        # 5) Offset 2D para mover el bloque en la pantalla
+        # 5) Offset 2D
         if offset_2d is not None:
             pts_2d = pts_2d + offset_2d
 
@@ -146,7 +146,7 @@ class SimpleCube3D:
         max_y = float(np.max(pts_2d[:, 1]))
         bbox = (min_x, max_x, min_y, max_y)
 
-        # 7) Ordenar caras por profundidad (pintar de atrás hacia adelante)
+        # 7) Ordenar caras por profundidad
         face_depths = []
         for i, face in enumerate(self.faces):
             z_mean = depths[face].mean()
@@ -173,29 +173,33 @@ class CubePiece:
     Una pieza (cubo pequeño) del bloque 2x2x2.
 
     - center_unit_3d: centro en coordenadas de bloque (±0.5, ±0.5, ±0.5).
-      El bloque completo ocupa el rango [-1, 1] en cada eje.
+      El bloque completo ocupa el rango aprox. [-1, 1] en cada eje antes de escalar.
     """
-
     def __init__(self, renderer, center_unit_3d):
         self.renderer = renderer
         self.center_unit_3d = np.array(center_unit_3d, dtype=np.float32)
 
-        # Estado de adjunción (para futuro; por ahora siempre adjuntos)
+        # Estado de adjunción al bloque
         self.attached = True
+        # Offset 2D cuando está separada
         self.free_offset_2d = np.array([0.0, 0.0], dtype=np.float32)
 
-        # Info 2D:
+        # Info 2D (actualizada en draw)
         self.last_pts_2d = None
         self.last_bbox = None
 
-        # Rotación local (se usará cuando se puedan separar)
+        # Rotación local (para giros individuales)
         self.local_angles = np.zeros(3, dtype=np.float32)  # [ax, ay, az]
+
+        # Escala relativa de la pieza respecto al bloque (para zoom por pieza)
+        # 1.0 => mismo tamaño que la escala global del bloque.
+        self.scale_factor = 1.0
 
     def current_offset_2d(self, group_offset_2d):
         """
         Offset 2D actual:
         - adjunto  -> offset del grupo (bloque completo).
-        - separado -> free_offset_2d (futuro).
+        - separado -> free_offset_2d.
         """
         if self.attached:
             return group_offset_2d
@@ -206,17 +210,22 @@ class CubePiece:
              group_offset_2d):
         """
         Dibuja la pieza como cubo 3D.
+        - base_scale: escala global del bloque (CompositeCubes.scale).
+        - scale_factor: escala relativa de la pieza (self.scale_factor).
         """
         offset_2d = self.current_offset_2d(group_offset_2d)
 
-        # Rotación total = global + local (por ahora local = 0)
+        # 🔹 Escala efectiva = escala global * factor local
+        effective_scale = base_scale * getattr(self, "scale_factor", 1.0)
+
+        # Rotación total = global + local
         angle_x = base_angle_x + self.local_angles[0]
         angle_y = base_angle_y + self.local_angles[1]
         angle_z = base_angle_z + self.local_angles[2]
 
         pts_2d, bbox = self.renderer.draw(
             frame,
-            scale=base_scale,
+            scale=effective_scale,
             angle_x=angle_x,
             angle_y=angle_y,
             angle_z=angle_z,
@@ -237,8 +246,6 @@ class CompositeCubes:
 
     - Todas las piezas comparten escala y rotación global.
     - Cada pieza tiene center_unit_3d en {±0.5}^3.
-    - Mientras no exista lógica de separación, se comportan SIEMPRE
-      como un solo objeto (CUBO GENERAL).
     """
 
     def __init__(self, initial_scale=0.3):
@@ -264,7 +271,7 @@ class CompositeCubes:
             (255, 0, 0),      # azul
             (0, 255, 255),    # amarillo
             (255, 0, 255),    # magenta
-            (255, 255, 0),    # cian invertido
+            (255, 255, 0),    # cian
             (128, 0, 255),    # violeta
             (0, 128, 255),    # naranja-azulado
         ]
@@ -291,7 +298,7 @@ class CompositeCubes:
         # Calculamos la profundidad (z) del centro de cada cubo
         depth_list = []
         for idx, piece in enumerate(self.pieces):
-            center_local = piece.center_unit_3d * self.scale  # después del zoom
+            center_local = piece.center_unit_3d * self.scale  # tras el zoom global
             center_rot = center_local @ R.T
             z = center_rot[2]
             depth_list.append((z, idx))
@@ -314,7 +321,7 @@ class CompositeCubes:
     # ---------- Movimiento conjunto ----------
     def move_group(self, dx, dy):
         """
-        Mueve TODO el bloque en 2D.
+        Mueve TODO el bloque en 2D (solo afecta a piezas adjuntas).
         """
         delta = np.array([dx, dy], dtype=np.float32)
         self.group_offset_2d += delta
@@ -323,25 +330,17 @@ class CompositeCubes:
     def rotate_global(self, d_ax, d_ay, d_az=0.0):
         """
         Rotación global del bloque (afecta a los 8 cubos).
-        (No se usa directamente desde control_cubo, pero se deja por claridad.)
         """
         self.angle_x += d_ax
         self.angle_y += d_ay
         self.angle_z += d_az
 
-    # ---------- Adjuntar/separar piezas (stub para futuro) ----------
-    def toggle_attach(self, index):
-        """
-        Stub para futuro: alternar adjunto / separado.
-        Por ahora NO se hace separación; todas las piezas permanecen adjuntas.
-        """
-        if 0 <= index < len(self.pieces):
-            pass
-
+    # ---------- Ayuda colisiones 2D ----------
     @staticmethod
     def _boxes_intersect(b1, b2):
         """
-        Función de ayuda para colisiones 2D (reservada para pasos futuros).
+        Función de ayuda para colisiones 2D.
+        b = (min_x, max_x, min_y, max_y)
         """
         x1_min, x1_max, y1_min, y1_max = b1
         x2_min, x2_max, y2_min, y2_max = b2
@@ -352,15 +351,148 @@ class CompositeCubes:
             return False
         return True
 
-    def move_piece(self, index, dx, dy):
+    # ---------- Separar una pieza ----------
+    def detach_piece(self, index, detach_factor=1.2):
         """
-        Stub para futuro: mover una pieza independiente.
-        Actualmente las piezas NO se separan, así que esta función
-        no altera la configuración.
+        Separa la pieza 'index' del bloque, moviéndola hacia afuera
+        sin encimarse con las demás (en 2D), pero SOLO un poco,
+        para que siga visible y cerca del bloque.
         """
         if not (0 <= index < len(self.pieces)):
             return
-        return
+
+        piece = self.pieces[index]
+        if not piece.attached:
+            # Ya estaba separada
+            return
+        if piece.last_bbox is None:
+            # Aún no se ha dibujado
+            return
+
+        min_x, max_x, min_y, max_y = piece.last_bbox
+        cx = 0.5 * (min_x + max_x)
+        cy = 0.5 * (min_y + max_y)
+
+        # Centro aproximado del bloque (promedio de todos los cubos)
+        sum_x = 0.0
+        sum_y = 0.0
+        count = 0
+        for p in self.pieces:
+            if p.last_bbox is None:
+                continue
+            mnx, mxx, mny, mxy = p.last_bbox
+            pcx = 0.5 * (mnx + mxx)
+            pcy = 0.5 * (mny + mxy)
+            sum_x += pcx
+            sum_y += pcy
+            count += 1
+
+        if count > 0:
+            bx = sum_x / count
+            by = sum_y / count
+        else:
+            bx, by = cx, cy  # fallback
+
+        # Dirección desde el centro del bloque hacia el cubo
+        dir_x = cx - bx
+        dir_y = cy - by
+        norm = math.hypot(dir_x, dir_y)
+        if norm < 1e-3:
+            # Si está exactamente en el centro, sácalo hacia arriba
+            dir_x, dir_y = 0.0, -1.0
+            norm = 1.0
+        dir_x /= norm
+        dir_y /= norm
+
+        # Tamaño del cubo en píxeles
+        width = max_x - min_x
+        height = max_y - min_y
+        base = max(width, height) * detach_factor
+
+        # Límite máximo para no alejarlo demasiado
+        max_extra = max(width, height) * 2.0
+        base = min(base, max_extra)
+
+        dx = dir_x * base
+        dy = dir_y * base
+        cand_bbox = (min_x + dx, max_x + dx, min_y + dy, max_y + dy)
+
+        # Ajuste fino por si aún chocara con algún otro cubo
+        for _ in range(3):
+            collision = False
+            for j, other in enumerate(self.pieces):
+                if j == index:
+                    continue
+                if other.last_bbox is None:
+                    continue
+                if self._boxes_intersect(cand_bbox, other.last_bbox):
+                    collision = True
+                    break
+            if not collision:
+                break
+            # Si sigue chocando, incrementamos muy poco la distancia
+            base *= 1.1
+            base = min(base, max_extra)
+            dx = dir_x * base
+            dy = dir_y * base
+            cand_bbox = (min_x + dx, max_x + dx, min_y + dy, max_y + dy)
+
+        # Marcamos la pieza como separada pero cerca del bloque
+        piece.attached = False
+        piece.free_offset_2d = self.group_offset_2d + np.array([dx, dy], dtype=np.float32)
+        piece.last_bbox = cand_bbox
+        print(f"[DETACH] Pieza {index} separada del bloque (dist={base:.1f}px).")
+
+    # ---------- Adjuntar/separar piezas (para futuro) ----------
+    def toggle_attach(self, index):
+        """
+        Alterna entre adjunto / separado.
+        Por ahora solo separa; re-enganchar podría implementarse después.
+        """
+        if not (0 <= index < len(self.pieces)):
+            return
+        piece = self.pieces[index]
+        if piece.attached:
+            self.detach_piece(index)
+        else:
+            piece.attached = True
+            piece.free_offset_2d = self.group_offset_2d.copy()
+            piece.scale_factor = 1.0
+            piece.local_angles[:] = 0.0
+            print(f"[ATTACH] Pieza {index} re-encajada en el bloque.")
+
+    # ---------- Mover pieza separada evitando encimarse ----------
+    def move_piece(self, index, dx, dy):
+        """
+        Mueve una pieza SEPARADA en 2D, evitando encimarse con otras.
+        """
+        if not (0 <= index < len(self.pieces)):
+            return
+
+        piece = self.pieces[index]
+        if piece.attached or piece.last_bbox is None:
+            # Si está adjunta, no se mueve individualmente.
+            return
+
+        new_offset = piece.free_offset_2d + np.array([dx, dy], dtype=np.float32)
+
+        # Bounding box tentativa: desplazamos la actual por (dx, dy)
+        min_x, max_x, min_y, max_y = piece.last_bbox
+        cand_bbox = (min_x + dx, max_x + dx, min_y + dy, max_y + dy)
+
+        # Comprobar colisión con todas las demás piezas
+        for j, other in enumerate(self.pieces):
+            if j == index:
+                continue
+            if other.last_bbox is None:
+                continue
+            if self._boxes_intersect(cand_bbox, other.last_bbox):
+                # Colisión: no se aplica el movimiento
+                return
+
+        # Sin colisión: aplicar movimiento
+        piece.free_offset_2d = new_offset
+        piece.last_bbox = cand_bbox
 
 
 # =====================================================
@@ -378,7 +510,7 @@ def main():
 
     composite = CompositeCubes(initial_scale=0.3)
 
-    print("Demo cubo 2x2x2 (8 cubos como un solo objeto):")
+    print("Demo cubo 2x2x2 (8 cubos como un solo objeto + separaciones):")
     print(" W/A/S/D: mover bloque completo")
     print(" Q: salir")
 
@@ -393,7 +525,7 @@ def main():
 
         cv2.putText(
             frame,
-            "Bloque 2x2x2 (8 cubos unidos)",
+            "Bloque 2x2x2",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
